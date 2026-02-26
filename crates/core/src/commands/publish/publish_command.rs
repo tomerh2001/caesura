@@ -1,6 +1,10 @@
 use crate::prelude::*;
 use gazelle_api::{GazelleClientTrait, GroupResponse};
-use tokio::fs::rename;
+use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, process};
+use tokio::fs::{remove_file, rename, write};
+use tokio::process::Command;
 
 /// Result of a publish operation.
 #[derive(Debug)]
@@ -37,6 +41,8 @@ pub(crate) struct PublishCommand {
     arg: Ref<PublishArg>,
     shared_options: Ref<SharedOptions>,
     publish_seeding_options: Ref<PublishSeedingOptions>,
+    batch_options: Ref<BatchOptions>,
+    upload_options: Ref<UploadOptions>,
     copy_options: Ref<CopyOptions>,
     api: Ref<Box<dyn GazelleClientTrait + Send + Sync>>,
     paths: Ref<PathManager>,
@@ -129,7 +135,9 @@ impl PublishCommand {
             PublishGroup::NewGroup(new_group) => {
                 self.publish_new_group(
                     new_group,
-                    torrent_path,
+                    &torrent_path,
+                    &seeding_source,
+                    &source_title,
                     release_description,
                     dry_run,
                     warnings,
@@ -139,7 +147,9 @@ impl PublishCommand {
             PublishGroup::ExistingGroup(existing_group) => {
                 self.publish_existing_group(
                     existing_group,
-                    torrent_path,
+                    &torrent_path,
+                    &seeding_source,
+                    &source_title,
                     release_description,
                     dry_run,
                     warnings,
@@ -256,6 +266,16 @@ impl PublishCommand {
             )
             .await;
         }
+        if let Err(error) = inject_torrent_with_client(
+            torrent_path,
+            &self.upload_options,
+            PublishAction::InjectTorrentClient,
+        )
+        .await
+        {
+            warn!("{}", error.render());
+            warnings.push(error.to_error());
+        }
 
         Ok(seeding_source)
     }
@@ -263,13 +283,18 @@ impl PublishCommand {
     async fn publish_new_group(
         &self,
         new_group: &PublishNewGroup,
-        torrent_path: PathBuf,
+        torrent_path: &Path,
+        seeding_source: &Path,
+        source_title: &str,
         release_description: String,
         dry_run: bool,
-        warnings: Vec<rogue_logging::Error>,
+        mut warnings: Vec<rogue_logging::Error>,
     ) -> Result<PublishSuccess, Failure<PublishAction>> {
-        let form =
-            PublishManifest::to_new_source_form(new_group, torrent_path, release_description);
+        let form = PublishManifest::to_new_source_form(
+            new_group,
+            torrent_path.to_path_buf(),
+            release_description,
+        );
         if dry_run {
             info!("{} upload as this is a dry run", "Skipping".bold());
             info!("{} data for source upload:", "Upload".bold());
@@ -285,6 +310,15 @@ impl PublishCommand {
             .upload_new_source(form)
             .await
             .map_err(Failure::wrap(PublishAction::UploadNewSource))?;
+        self.execute_post_upload_hook(
+            source_title,
+            seeding_source,
+            torrent_path,
+            response.group_id,
+            response.torrent_id,
+            &mut warnings,
+        )
+        .await;
         Ok(PublishSuccess {
             group_id: Some(response.group_id),
             torrent_id: Some(response.torrent_id),
@@ -295,14 +329,16 @@ impl PublishCommand {
     async fn publish_existing_group(
         &self,
         existing_group: &PublishExistingGroup,
-        torrent_path: PathBuf,
+        torrent_path: &Path,
+        seeding_source: &Path,
+        source_title: &str,
         release_description: String,
         dry_run: bool,
-        warnings: Vec<rogue_logging::Error>,
+        mut warnings: Vec<rogue_logging::Error>,
     ) -> Result<PublishSuccess, Failure<PublishAction>> {
         let form = PublishManifest::to_existing_group_form(
             existing_group,
-            torrent_path,
+            torrent_path.to_path_buf(),
             release_description,
         );
         if dry_run {
@@ -332,11 +368,107 @@ impl PublishCommand {
             .upload_torrent(form)
             .await
             .map_err(Failure::wrap(PublishAction::UploadExistingGroup))?;
+        self.execute_post_upload_hook(
+            source_title,
+            seeding_source,
+            torrent_path,
+            response.group_id,
+            response.torrent_id,
+            &mut warnings,
+        )
+        .await;
         Ok(PublishSuccess {
             group_id: Some(response.group_id),
             torrent_id: Some(response.torrent_id),
             warnings,
         })
+    }
+
+    async fn execute_post_upload_hook(
+        &self,
+        source_name: &str,
+        seeding_source: &Path,
+        torrent_path: &Path,
+        group_id: u32,
+        torrent_id: u32,
+        warnings: &mut Vec<rogue_logging::Error>,
+    ) {
+        let Some(hook_path) = &self.batch_options.post_upload_hook else {
+            return;
+        };
+        let payload = self.create_hook_payload(
+            source_name,
+            seeding_source,
+            torrent_path,
+            group_id,
+            torrent_id,
+        );
+        if let Err(error) = self.execute_hook(hook_path, &payload).await {
+            warn!("{}", error.render());
+            warnings.push(error.to_error());
+        }
+    }
+
+    fn create_hook_payload(
+        &self,
+        source_name: &str,
+        seeding_source: &Path,
+        torrent_path: &Path,
+        group_id: u32,
+        torrent_id: u32,
+    ) -> PublishHookPayload {
+        PublishHookPayload {
+            torrent_id: Some(torrent_id),
+            group_id: Some(group_id),
+            permalink: Some(get_permalink(
+                &self.shared_options.indexer_url,
+                group_id,
+                torrent_id,
+            )),
+            source_name: source_name.to_owned(),
+            source_path: seeding_source.to_string_lossy().to_string(),
+            transcode_path: seeding_source.to_string_lossy().to_string(),
+            torrent_path: torrent_path.to_string_lossy().to_string(),
+        }
+    }
+
+    async fn execute_hook(
+        &self,
+        hook_path: &Path,
+        payload: &PublishHookPayload,
+    ) -> Result<(), Failure<PublishAction>> {
+        let payload_yaml = serde_yaml::to_string(payload)
+            .map_err(Failure::wrap(PublishAction::SerializeHookPayload))?;
+        let payload_path = Self::get_hook_payload_path();
+        write(&payload_path, payload_yaml)
+            .await
+            .map_err(Failure::wrap_with_path(
+                PublishAction::WriteHookPayload,
+                &payload_path,
+            ))?;
+        let mut command = Command::new("bash");
+        command.arg(hook_path).arg(&payload_path);
+        let result = command.run().await.map_err(Failure::wrap_with_path(
+            PublishAction::ExecuteHook,
+            hook_path,
+        ));
+        if let Err(error) = remove_file(&payload_path).await {
+            warn!(
+                "{} to remove hook payload {}: {error}",
+                "Failed".bold(),
+                payload_path.display()
+            );
+        }
+        result?;
+        trace!("{} hook {}", "Executed".bold(), hook_path.display());
+        Ok(())
+    }
+
+    fn get_hook_payload_path() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |value| value.as_nanos());
+        env::temp_dir().join(format!("caesura-hook-{}-{timestamp}.yml", process::id()))
     }
 
     fn is_duplicate_existing_group_source(
@@ -407,4 +539,15 @@ impl PublishCommand {
         }
         Ok(())
     }
+}
+
+#[derive(Serialize)]
+struct PublishHookPayload {
+    torrent_id: Option<u32>,
+    group_id: Option<u32>,
+    permalink: Option<String>,
+    source_name: String,
+    source_path: String,
+    transcode_path: String,
+    torrent_path: String,
 }

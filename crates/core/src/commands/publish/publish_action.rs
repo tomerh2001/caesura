@@ -17,6 +17,14 @@ pub enum PublishAction {
     VerifySeedContent,
     #[error("inject torrent into client")]
     InjectTorrent,
+    #[error("inject torrent via client API")]
+    InjectTorrentClient,
+    #[error("serialize hook payload")]
+    SerializeHookPayload,
+    #[error("write hook payload")]
+    WriteHookPayload,
+    #[error("execute hook")]
+    ExecuteHook,
     #[error("get torrent group")]
     GetTorrentGroup,
     #[error("check duplicate source")]

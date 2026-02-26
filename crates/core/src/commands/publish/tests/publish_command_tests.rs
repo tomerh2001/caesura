@@ -773,6 +773,174 @@ async fn publish_injection_failure_is_non_fatal() -> Result<(), TestError> {
 }
 
 #[tokio::test]
+async fn publish_torrent_client_injection_failure_is_warning() -> Result<(), TestError> {
+    // Arrange
+    init_logger();
+    let source_dir = TempDirectory::create("publish_torrent_client_injection_failure_source");
+    let source_path = source_dir.to_path_buf();
+    fs::write(source_path.join("01 Track.flac"), "source track")?;
+    let manifest = PublishManifest::mock_new(source_path);
+    manifest.validate().expect("manifest should be valid");
+    let content_dir = TempDirectory::create("publish_torrent_client_injection_failure_content");
+    let output_dir = TempDirectory::create("publish_torrent_client_injection_failure_output");
+    let test_dir = TestDirectory::new();
+    let response = UploadResponse {
+        private: true,
+        source: true,
+        request_id: None,
+        torrent_id: 500_116,
+        group_id: 600_116,
+    };
+    let mock = MockGazelleClient::new().with_upload_new_source(Ok(response));
+    let host = HostBuilder::new()
+        .with_mock_client(mock)
+        .with_test_options(&test_dir)
+        .await
+        .with_options(SharedOptions {
+            content: vec![content_dir.to_path_buf()],
+            output: output_dir.to_path_buf(),
+            ..SharedOptions::mock()
+        })
+        .with_options(UploadOptions {
+            torrent_client: Some(TorrentClient::Qbittorrent),
+            torrent_client_url: Some("http://127.0.0.1:1".to_owned()),
+            torrent_client_username: Some("admin".to_owned()),
+            torrent_client_password: Some("secret".to_owned()),
+            ..UploadOptions::default()
+        })
+        .with_options(PublishArg {
+            publish_path: PathBuf::from("/tmp/unused.yml"),
+            dry_run: false,
+        })
+        .expect_build();
+    let command = host.services.get_required::<PublishCommand>();
+
+    // Act
+    let result = command.execute(&manifest).await?;
+
+    // Assert
+    assert!(result.torrent_id.is_some(), "publish should still upload");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.action.contains("inject torrent via client API")),
+        "expected torrent client injection warning"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn publish_post_upload_hook_receives_payload() -> Result<(), TestError> {
+    // Arrange
+    init_logger();
+    let source_dir = TempDirectory::create("publish_post_upload_hook_receives_payload_source");
+    let source_path = source_dir.to_path_buf();
+    fs::write(source_path.join("01 Track.flac"), "source track")?;
+    let manifest = PublishManifest::mock_new(source_path.clone());
+    manifest.validate().expect("manifest should be valid");
+    let content_dir = TempDirectory::create("publish_post_upload_hook_receives_payload_content");
+    let output_dir = TempDirectory::create("publish_post_upload_hook_receives_payload_output");
+    let hook_dir = TempDirectory::create("publish_post_upload_hook_receives_payload_hook");
+    let hook_path = hook_dir.join("post-upload-hook.sh");
+    let hook_payload_path = hook_dir.join("post-upload-payload.yml");
+    let script = format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\ncp \"$1\" \"{}\"\n",
+        hook_payload_path.display()
+    );
+    fs::write(&hook_path, script)?;
+    let test_dir = TestDirectory::new();
+    let response = UploadResponse {
+        private: true,
+        source: true,
+        request_id: None,
+        torrent_id: 500_117,
+        group_id: 600_117,
+    };
+    let mock = MockGazelleClient::new().with_upload_new_source(Ok(response));
+    let host = HostBuilder::new()
+        .with_mock_client(mock)
+        .with_test_options(&test_dir)
+        .await
+        .with_options(SharedOptions {
+            content: vec![content_dir.to_path_buf()],
+            output: output_dir.to_path_buf(),
+            ..SharedOptions::mock()
+        })
+        .with_options(BatchOptions {
+            post_upload_hook: Some(hook_path),
+            ..BatchOptions::default()
+        })
+        .with_options(PublishArg {
+            publish_path: PathBuf::from("/tmp/unused.yml"),
+            dry_run: false,
+        })
+        .expect_build();
+    let command = host.services.get_required::<PublishCommand>();
+
+    // Act
+    let result = command.execute(&manifest).await?;
+
+    // Assert
+    assert!(result.torrent_id.is_some(), "publish should succeed");
+    assert!(
+        hook_payload_path.is_file(),
+        "post-upload hook should write payload file"
+    );
+    let payload_yaml = fs::read_to_string(&hook_payload_path)?;
+    let payload: serde_yaml::Value = serde_yaml::from_str(&payload_yaml)?;
+    assert_eq!(
+        payload
+            .get("torrent_id")
+            .and_then(serde_yaml::Value::as_u64)
+            .expect("torrent_id should be present"),
+        500_117
+    );
+    assert_eq!(
+        payload
+            .get("group_id")
+            .and_then(serde_yaml::Value::as_u64)
+            .expect("group_id should be present"),
+        600_117
+    );
+    let permalink = payload
+        .get("permalink")
+        .and_then(serde_yaml::Value::as_str)
+        .expect("permalink should be set after upload");
+    assert!(permalink.contains("torrentid=500117"));
+    let source_name = payload
+        .get("source_name")
+        .and_then(serde_yaml::Value::as_str)
+        .expect("source_name should be present");
+    assert_eq!(source_name, manifest.group.source_title());
+    let source_path_payload = payload
+        .get("source_path")
+        .and_then(serde_yaml::Value::as_str)
+        .expect("source_path should be set");
+    assert!(
+        PathBuf::from(source_path_payload).is_dir(),
+        "source_path should exist: {source_path_payload}"
+    );
+    let transcode_path = payload
+        .get("transcode_path")
+        .and_then(serde_yaml::Value::as_str)
+        .expect("transcode_path should be set");
+    assert!(
+        PathBuf::from(transcode_path).is_dir(),
+        "transcode_path should exist: {transcode_path}"
+    );
+    let torrent_path = payload
+        .get("torrent_path")
+        .and_then(serde_yaml::Value::as_str)
+        .expect("torrent_path should be set");
+    assert!(
+        PathBuf::from(torrent_path).is_file(),
+        "torrent_path should exist: {torrent_path}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn publish_dry_run_does_not_stage_or_inject() -> Result<(), TestError> {
     // Arrange
     init_logger();
