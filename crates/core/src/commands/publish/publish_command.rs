@@ -1,10 +1,7 @@
 use crate::prelude::*;
 use gazelle_api::{GazelleClientTrait, GroupResponse};
 use serde::Serialize;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{env, process};
-use tokio::fs::{remove_file, rename, write};
-use tokio::process::Command;
+use tokio::fs::rename;
 
 /// Result of a publish operation.
 #[derive(Debug)]
@@ -403,7 +400,15 @@ impl PublishCommand {
             group_id,
             torrent_id,
         );
-        if let Err(error) = self.execute_hook(hook_path, &payload).await {
+        if let Err(error) = execute_yaml_hook(
+            hook_path,
+            &payload,
+            PublishAction::SerializeHookPayload,
+            PublishAction::WriteHookPayload,
+            PublishAction::ExecuteHook,
+        )
+        .await
+        {
             warn!("{}", error.render());
             warnings.push(error.to_error());
         }
@@ -430,45 +435,6 @@ impl PublishCommand {
             transcode_path: seeding_source.to_string_lossy().to_string(),
             torrent_path: torrent_path.to_string_lossy().to_string(),
         }
-    }
-
-    async fn execute_hook(
-        &self,
-        hook_path: &Path,
-        payload: &PublishHookPayload,
-    ) -> Result<(), Failure<PublishAction>> {
-        let payload_yaml = serde_yaml::to_string(payload)
-            .map_err(Failure::wrap(PublishAction::SerializeHookPayload))?;
-        let payload_path = Self::get_hook_payload_path();
-        write(&payload_path, payload_yaml)
-            .await
-            .map_err(Failure::wrap_with_path(
-                PublishAction::WriteHookPayload,
-                &payload_path,
-            ))?;
-        let mut command = Command::new("bash");
-        command.arg(hook_path).arg(&payload_path);
-        let result = command.run().await.map_err(Failure::wrap_with_path(
-            PublishAction::ExecuteHook,
-            hook_path,
-        ));
-        if let Err(error) = remove_file(&payload_path).await {
-            warn!(
-                "{} to remove hook payload {}: {error}",
-                "Failed".bold(),
-                payload_path.display()
-            );
-        }
-        result?;
-        trace!("{} hook {}", "Executed".bold(), hook_path.display());
-        Ok(())
-    }
-
-    fn get_hook_payload_path() -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |value| value.as_nanos());
-        env::temp_dir().join(format!("caesura-hook-{}-{timestamp}.yml", process::id()))
     }
 
     fn is_duplicate_existing_group_source(
